@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Creekside — Generate Bill</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#272b35; --txt:#e6e8ee; --muted:#9aa3b2;
+          --accent:#4f8cff; --good:#36b37e; --warn:#e2b53d; --bad:#e0556b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:18px 28px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  main { padding:24px 28px; max-width:980px; margin:0 auto; }
+  .controls { display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; margin-bottom:22px; }
+  .controls label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; }
+  input[type=date] { background:#11141a; border:1px solid var(--line); color:var(--txt); border-radius:7px; padding:8px 10px; font-size:14px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px; padding:9px 18px; font-size:14px; font-weight:600; cursor:pointer; }
+  button:hover { filter:brightness(1.1); } button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:22px 26px; margin-bottom:20px; }
+  .billhead { display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid var(--line); padding-bottom:14px; margin-bottom:8px; }
+  .billhead .period { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  td.num, th.num { text-align:right; }
+  .total-row td { font-weight:700; font-size:16px; border-top:2px solid var(--line); border-bottom:0; padding-top:14px; }
+  .sub td { color:var(--muted); }
+  .warn { color:var(--warn); font-size:12px; margin-top:10px; }
+  .muted { color:var(--muted); } .small { font-size:12px; }
+  details { margin-top:8px; } summary { cursor:pointer; color:var(--accent); font-size:13px; }
+  .lines { margin-top:12px; max-height:420px; overflow:auto; }
+  .lines td, .lines th { font-size:12px; padding:6px 8px; }
+  .empty { color:var(--muted); font-style:italic; padding:14px 0; }
+  .money { font-variant-numeric:tabular-nums; }
+  #err { color:var(--bad); margin-top:10px; }
+</style>
+</head>
+<body>
+<header><h1>Generate Bill</h1></header>
+<main>
+  <div class="controls">
+    <div><label>Period start (ship date)</label><input type="date" id="start"></div>
+    <div><label>Period end</label><input type="date" id="end"></div>
+    <div><label>Mode</label>
+      <select id="status" style="background:#11141a;border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:8px 10px;font-size:14px">
+        <option value="all">All charges</option>
+        <option value="unbilled">To invoice (unbilled)</option>
+        <option value="billed">Billed (reprint)</option>
+      </select>
+    </div>
+    <button id="go">Generate bill</button>
+    <button class="ghost" id="pdf" disabled>Download invoice (PDF)</button>
+    <button class="ghost" id="csv" disabled>Download lines (CSV)</button>
+  </div>
+
+  <div id="out"></div>
+  <div id="err"></div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const money = v => '$' + Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+let lastLines = [];
+
+// default to the last 14 days
+(() => {
+  const end = new Date(), start = new Date(Date.now() - 14*864e5);
+  $('#end').value = end.toISOString().slice(0,10);
+  $('#start').value = start.toISOString().slice(0,10);
+})();
+
+async function generate(){
+  $('#err').textContent=''; $('#out').innerHTML='<p class="muted">Generating…</p>';
+  $('#go').disabled=true; $('#csv').disabled=true;
+  try{
+    const s=$('#start').value, e=$('#end').value, st=$('#status').value;
+    const r = await fetch(`/api/bill?start=${s}&end=${e}&status=${st}`);
+    const b = await r.json();
+    if(!r.ok) throw new Error(b.error||r.statusText);
+    render(b); lastLines=b.lines||[]; $('#csv').disabled=lastLines.length===0; $('#pdf').disabled=lastLines.length===0;
+  }catch(ex){ $('#out').innerHTML=''; $('#err').textContent=ex.message; }
+  finally{ $('#go').disabled=false; }
+}
+
+function render(b){
+  const svc = (b.service||[]).map(s=>`
+    <tr><td>${s.transaction_type||'—'} service</td>
+        <td class="num">${s.tags}</td><td class="num">${Number(s.qty).toLocaleString()}</td>
+        <td class="num money">${money(s.amount)}</td></tr>`).join('');
+  const warn = [
+    b.tags_missing_rate>0 ? `⚠ ${b.tags_missing_rate} tag(s) have no rate and are excluded from the amount.` : '',
+    (b.status==='all' && b.tags_billed>0) ? `ℹ ${b.tags_billed} of these tag(s) are already billed.` : '',
+  ].filter(Boolean).map(t=>`<div class="warn">${t}</div>`).join('');
+  $('#out').innerHTML = `
+   <div class="panel">
+     <div class="billhead">
+       <div><b>Packing Charges</b> <span class="muted small">· ${b.status==='billed'?'billed (reprint)':'to invoice'}</span></div>
+       <div class="period">${b.start} → ${b.end}</div>
+     </div>
+     <table>
+       <thead><tr><th>Charge</th><th class="num">Tags</th><th class="num">Cartons</th><th class="num">Amount</th></tr></thead>
+       <tbody>
+         ${svc || '<tr><td colspan="4" class="empty">No billable service charges in this period.</td></tr>'}
+         <tr class="sub"><td>Labor</td><td class="num">—</td><td class="num">—</td><td class="num money">${money(b.labor_total)}</td></tr>
+         <tr class="total-row"><td>Total</td><td></td><td></td><td class="num money">${money(b.total)}</td></tr>
+       </tbody>
+     </table>
+     ${warn}
+     <details>
+       <summary>${(b.lines||[]).length} line items</summary>
+       <div class="lines"><table>
+         <thead><tr><th>Tag</th><th>Product</th><th>Type</th><th>Ship date</th><th class="num">Rate</th><th class="num">Qty</th><th class="num">Amount</th></tr></thead>
+         <tbody>${(b.lines||[]).map(l=>`<tr>
+            <td>${l.tagid}</td><td>${l.productname||''}</td><td>${l.transaction_type||''}</td>
+            <td>${l.ship_date||''}</td><td class="num">${(l.rate==null||l.rate==='')?'—':money(l.rate)}</td>
+            <td class="num">${l.shipped_qty}</td><td class="num money">${l.amount!==''?money(l.amount):'—'}</td></tr>`).join('')}</tbody>
+       </table></div>
+     </details>
+   </div>`;
+}
+
+function downloadCsv(){
+  if(!lastLines.length) return;
+  const cols = ['tagid','productname','transaction_type','ship_date','billing_week','commodity','style','bagtype','rate','shipped_qty','amount'];
+  const esc = v => `"${String(v??'').replace(/"/g,'""')}"`;
+  const rows = [cols.join(',')].concat(lastLines.map(l=>cols.map(c=>esc(l[c])).join(',')));
+  const url = URL.createObjectURL(new Blob([rows.join('\n')], {type:'text/csv'}));
+  const a = document.createElement('a');
+  a.href=url; a.download=`bill_${$('#start').value}_${$('#end').value}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
+
+$('#go').onclick = generate;
+$('#csv').onclick = downloadCsv;
+$('#pdf').onclick = () => {
+  const s=$('#start').value, e=$('#end').value, st=$('#status').value;
+  window.open(`/api/invoice.pdf?start=${s}&end=${e}&status=${st}`, '_blank');
+};
+generate();
+</script>
+</body>
+</html>
