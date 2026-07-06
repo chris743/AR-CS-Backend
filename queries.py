@@ -145,8 +145,9 @@ def storage_charges(start: str | None = None, end: str | None = None,
     elif status == "billed":
         where += " AND billed"
     return db.query(
-        f"SELECT tagid, sono, lastconame, recv_date, ship_date, billing_week, "
-        f"       days_in_storage, free_days, billable_days, rate, amount, rate_missing, billed "
+        f"SELECT tagid, sono, lastconame, commodity, style, bagtype, shipped_qty, "
+        f"       recv_date, ship_date, billing_week, days_in_storage, billable_days, "
+        f"       rate, amount, rate_missing, billed "
         f"FROM {db.qualified('v_storage_charges')} WHERE {where} "
         f"ORDER BY billing_week, amount DESC NULLS LAST",
         **params,

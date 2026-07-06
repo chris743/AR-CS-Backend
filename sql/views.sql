@@ -25,12 +25,14 @@ CREATE TABLE IF NOT EXISTS creekside_core.labor_charges (
     icrunidx bigint, week_end text, productdescr text, quantity numeric,
     num_laborers numeric, hours_per_laborer numeric, labor_rate numeric, labor_charge numeric
 );
--- Storage rates: a pallet accrues storage after a free period (free_days), then
--- rate_per_day per pallet per day. Flat by default (commodity IS NULL = the rate
--- for every pallet); a commodity-specific row overrides it. Editable without code
--- (rates.set_storage_rate / cli storage-rate). See v_storage_charges.
+-- Storage rates: per-carton cold-storage rate by pack form, ingested from the
+-- Reedley Charges workbook (rates.ingest_storage_rates / cli ingest-storage-rates).
+-- Keyed like packing_rates — (commtype, commodity, style, bagtype) — so v_storage_charges
+-- can join it through product_classification. rate is $ per carton per day; a full
+-- pallet works out to ~$60/day (rate = 60 / ctns_per_pallet). See v_storage_charges.
 CREATE TABLE IF NOT EXISTS creekside_core.storage_rates (
-    commodity text, free_days integer NOT NULL DEFAULT 7, rate_per_day numeric
+    commtype text, commodity text, style text, bagtype text,
+    ctns_per_pallet numeric, rate numeric
 );
 -- charge_type distinguishes a tag's storage billing from its packing billing on the
 -- shared billing-lines table: NULL/'PACKING' = the packing/repack service charge (all
@@ -82,7 +84,10 @@ SELECT s.pallet::bigint            AS tagid,
                 THEN to_date(left(s.shipdatetime, 10), 'MM/DD/YYYY') END) AS ship_date,
        -- receive date (same guard) — drives storage days = ship_date - recv_date
        min(CASE WHEN s.recvdate ~ '^\d{2}/\d{2}/\d{4}'
-                THEN to_date(left(s.recvdate, 10), 'MM/DD/YYYY') END) AS recv_date
+                THEN to_date(left(s.recvdate, 10), 'MM/DD/YYYY') END) AS recv_date,
+       -- product name off the shipping report (most shipped pallets never hit the
+       -- repack tables, so this is the only route to a classification for storage)
+       min(s.productdescr) AS productname
 FROM creekside_core.cs_packing_shipping_raw s
 WHERE s.pallet IS NOT NULL
   AND s.recordtype = 5
@@ -274,20 +279,17 @@ CREATE OR REPLACE VIEW creekside_core.v_billed_lines AS
 SELECT * FROM creekside_core.v_charges WHERE billed;
 
 -- ---------------------------------------------------------------------------
--- v_storage_charges: one row per shipped pallet that sat past the free period.
---   days_in_storage = ship_date - recv_date; billable_days = the days beyond
---   free_days; amount = billable_days x rate_per_day (flat, per pallet). The rate
---   and free period come from the default storage_rates row (commodity IS NULL).
---   rate_missing flags pallets with no configured rate, and `billed` reflects a
---   STORAGE line already recorded for the tag — mirroring the PACK conventions in
---   v_charges. Only pallets that actually incurred storage (days > free_days) appear.
+-- v_storage_charges: one row per shipped pallet that sat past the 7-day free period.
+--   days_in_storage = ship_date - recv_date; billable_days = days beyond 7.
+--   The rate is per carton per day, looked up by the pallet's pack form
+--   (product_classification -> storage_rates, exact then GIRO fallback, like
+--   v_charges). amount = shipped_qty (cartons) x rate x billable_days, so a full
+--   pallet is ~$60/day. rate_missing flags pallets with no matching per-carton rate
+--   (most setback/bin/unclassified pallets — add mappings to storage_rates to price
+--   them); `billed` reflects a STORAGE line already recorded for the tag.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW creekside_core.v_storage_charges AS
-WITH def AS (   -- the flat rate + free period (the commodity-NULL default row)
-    SELECT coalesce(free_days, 7) AS free_days, rate_per_day
-    FROM creekside_core.storage_rates WHERE commodity IS NULL LIMIT 1
-),
-billed_storage AS (
+WITH billed_storage AS (
     SELECT DISTINCT tagid::bigint AS tagid
     FROM creekside_core.cs_packing_billing_lines
     WHERE tagid IS NOT NULL AND charge_type = 'STORAGE'
@@ -295,31 +297,45 @@ billed_storage AS (
 SELECT sh.tagid,
        sh.sono,
        sh.lastconame,
+       sh.productname,
+       pc.type       AS commtype,
+       pc.commodity,
+       pc.style,
+       pc.bagtype,
+       sh.shipped_qty,
        sh.recv_date,
        sh.ship_date,
        (sh.ship_date + mod(7 - extract(dow FROM sh.ship_date)::int, 7) * interval '1 day')::date
            AS billing_week,
-       (sh.ship_date - sh.recv_date)                              AS days_in_storage,
-       coalesce(def.free_days, 7)                                 AS free_days,
-       (sh.ship_date - sh.recv_date) - coalesce(def.free_days, 7) AS billable_days,
-       def.rate_per_day                                           AS rate,
-       round(((sh.ship_date - sh.recv_date) - coalesce(def.free_days, 7))
-             * def.rate_per_day, 2)                               AS amount,
-       (def.rate_per_day IS NULL)                                 AS rate_missing,
-       (b.tagid IS NOT NULL)                                      AS billed
+       (sh.ship_date - sh.recv_date)         AS days_in_storage,
+       7                                     AS free_days,
+       (sh.ship_date - sh.recv_date) - 7     AS billable_days,
+       coalesce(sr.rate, srg.rate)           AS rate,
+       round(sh.shipped_qty * coalesce(sr.rate, srg.rate)
+             * ((sh.ship_date - sh.recv_date) - 7), 2) AS amount,
+       (coalesce(sr.rate, srg.rate) IS NULL) AS rate_missing,
+       (srg.rate IS NOT NULL AND sr.rate IS NULL) AS rate_giro_fallback,
+       (b.tagid IS NOT NULL)                 AS billed
 FROM creekside_core.v_shipped sh
-LEFT JOIN def ON true
+LEFT JOIN creekside_core.product_classification pc ON pc.productname = sh.productname
+-- exact per-carton rate for the pallet's pack form
+LEFT JOIN creekside_core.storage_rates sr
+       ON sr.commtype = pc.type AND sr.commodity = pc.commodity
+      AND sr.style = pc.style AND sr.bagtype = pc.bagtype
+-- GIRO fallback within (commtype, commodity, style), mirroring v_charges
+LEFT JOIN creekside_core.storage_rates srg
+       ON srg.commtype = pc.type AND srg.commodity = pc.commodity
+      AND srg.style = pc.style AND srg.bagtype = 'GIRO'
 LEFT JOIN billed_storage b ON b.tagid = sh.tagid
 WHERE sh.recv_date IS NOT NULL
   AND sh.ship_date IS NOT NULL
-  AND (sh.ship_date - sh.recv_date) > coalesce(def.free_days, 7);
+  AND (sh.ship_date - sh.recv_date) > 7;
 
 -- v_storage_candidates: storage rollup by billing week (mirrors v_bill_candidates),
 -- over the not-yet-billed storage charges — what storage there is left to invoice.
 CREATE OR REPLACE VIEW creekside_core.v_storage_candidates AS
 SELECT billing_week,
        count(*)                              AS pallets,
-       sum(billable_days)                    AS pallet_days,
        sum(amount)                           AS amount,
        count(*) FILTER (WHERE rate_missing)  AS pallets_missing_rate
 FROM creekside_core.v_storage_charges

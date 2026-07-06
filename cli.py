@@ -10,8 +10,8 @@ Commands:
   unbilled-shipped           shipped but not billed (any reason)
   chain <tag>                full repack chain behind one shipped tag
   billable-chain             one row per billable chain node (chain-aware billing)
-  storage-rate <r> [--free-days N]   set the flat storage $/pallet/day (default free 7d)
-  storage-charges [--start --end --status]   per-pallet storage charges (days past free period)
+  ingest-storage-rates [path]        load per-carton cold-storage rates from the workbook STORAGE tab
+  storage-charges [--start --end --status]   per-pallet storage charges (cartons x rate x days past 7)
 """
 
 import argparse
@@ -40,9 +40,9 @@ def main(argv=None) -> int:
     sub.add_parser("billable")
     sub.add_parser("unbilled-shipped")
     sub.add_parser("mirror-rates")
-    sr8 = sub.add_parser("storage-rate")
-    sr8.add_argument("rate_per_day", type=float, help="storage $ per pallet per day")
-    sr8.add_argument("--free-days", type=int, default=7, help="free days before storage accrues")
+    isr = sub.add_parser("ingest-storage-rates")
+    isr.add_argument("path", nargs="?", default="CF - Reedley Charges.xlsx",
+                     help="Reedley Charges workbook (reads its STORAGE tab)")
     scg = sub.add_parser("storage-charges")
     scg.add_argument("--start", default=None)
     scg.add_argument("--end", default=None)
@@ -103,14 +103,13 @@ def main(argv=None) -> int:
         print(df["billing_status"].fillna("(no reason)").value_counts().to_string())
     elif args.cmd == "mirror-rates":
         print(f"mirrored {rates.mirror()} rate rows into packing_rates")
-    elif args.cmd == "storage-rate":
-        print(rates.set_storage_rate(args.rate_per_day, args.free_days))
+    elif args.cmd == "ingest-storage-rates":
+        print(f"loaded {rates.ingest_storage_rates(args.path)} storage rate rows into storage_rates")
     elif args.cmd == "storage-charges":
         df = queries.storage_charges(args.start, args.end, args.status)
         print(df.head(40).to_string(index=False))
-        print(f"\n{len(df)} pallets, {int(df['billable_days'].fillna(0).sum())} pallet-days, "
-              f"${df['amount'].fillna(0).sum():,.2f}; "
-              f"{int(df['rate_missing'].sum())} pallets missing a rate")
+        print(f"\n{len(df)} pallets, ${df['amount'].fillna(0).sum():,.2f}; "
+              f"{int(df['rate_missing'].sum())} pallets missing a per-carton rate")
     elif args.cmd == "refresh-classification":
         print(classify.refresh())
     elif args.cmd == "bill-candidates":

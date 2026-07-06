@@ -61,10 +61,9 @@ def for_period(start: str, end: str, status: str = "all") -> dict:
         f"AND to_date(week_end, 'YYYY-MM-DD') BETWEEN :s AND :e",
         s=start, e=end,
     )
-    # Storage: per-pallet days-in-storage charges over the same ship-date window/status.
+    # Storage: per-carton days-in-storage charges over the same ship-date window/status.
     storage = db.query(
-        f"SELECT count(*) AS pallets, sum(billable_days) AS pallet_days, "
-        f"       coalesce(sum(amount), 0) AS amount, "
+        f"SELECT count(*) AS pallets, coalesce(sum(amount), 0) AS amount, "
         f"       count(*) FILTER (WHERE rate_missing) AS pallets_missing_rate "
         f"FROM {db.qualified('v_storage_charges')} WHERE {where}",
         s=start, e=end,
@@ -165,13 +164,13 @@ def invoice_for_period(start: str, end: str, status: str = "all",
         s=start, e=end,
     ).iloc[0]["n"])
 
-    # Storage charges: billed on pallet-days past the free period, one invoice line
-    # per (rate, free_days). Rate-missing pallets are excluded like packing charges.
+    # Storage charges: per-carton, billed on carton-days past the 7-day free period,
+    # one invoice line per pack form. Rate-missing pallets are excluded like packing.
     storage = db.query(
-        f"SELECT free_days, rate, count(*) AS pallets, sum(billable_days) AS pallet_days, "
-        f"       sum(amount) AS amount "
+        f"SELECT commodity, style, bagtype, rate, count(*) AS pallets, "
+        f"       sum(shipped_qty * billable_days) AS carton_days, sum(amount) AS amount "
         f"FROM {db.qualified('v_storage_charges')} WHERE {where} AND NOT rate_missing "
-        f"GROUP BY free_days, rate ORDER BY rate",
+        f"GROUP BY commodity, style, bagtype, rate ORDER BY commodity, style, bagtype",
         s=start, e=end,
     )
     skipped += int(db.query(
@@ -193,9 +192,10 @@ def invoice_for_period(start: str, end: str, status: str = "all",
             "amount": float(r.amount or 0),
         })
     for r in storage.itertuples():
+        parts = [str(p) for p in (r.commodity, r.style, r.bagtype) if p]
         items.append({
-            "description": f"STORAGE - {int(r.pallets)} pallets past {int(r.free_days)}-day free period",
-            "quantity": float(r.pallet_days or 0),
+            "description": "COLD STORAGE - " + " ".join(parts),
+            "quantity": float(r.carton_days or 0),
             "price": float(r.rate or 0),
             "amount": float(r.amount or 0),
         })
