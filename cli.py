@@ -10,6 +10,8 @@ Commands:
   unbilled-shipped           shipped but not billed (any reason)
   chain <tag>                full repack chain behind one shipped tag
   billable-chain             one row per billable chain node (chain-aware billing)
+  storage-rate <r> [--free-days N]   set the flat storage $/pallet/day (default free 7d)
+  storage-charges [--start --end --status]   per-pallet storage charges (days past free period)
 """
 
 import argparse
@@ -38,6 +40,13 @@ def main(argv=None) -> int:
     sub.add_parser("billable")
     sub.add_parser("unbilled-shipped")
     sub.add_parser("mirror-rates")
+    sr8 = sub.add_parser("storage-rate")
+    sr8.add_argument("rate_per_day", type=float, help="storage $ per pallet per day")
+    sr8.add_argument("--free-days", type=int, default=7, help="free days before storage accrues")
+    scg = sub.add_parser("storage-charges")
+    scg.add_argument("--start", default=None)
+    scg.add_argument("--end", default=None)
+    scg.add_argument("--status", default="unbilled")
     sub.add_parser("refresh-classification")
     sub.add_parser("bill-candidates")
     bl = sub.add_parser("bill-lines")
@@ -94,6 +103,14 @@ def main(argv=None) -> int:
         print(df["billing_status"].fillna("(no reason)").value_counts().to_string())
     elif args.cmd == "mirror-rates":
         print(f"mirrored {rates.mirror()} rate rows into packing_rates")
+    elif args.cmd == "storage-rate":
+        print(rates.set_storage_rate(args.rate_per_day, args.free_days))
+    elif args.cmd == "storage-charges":
+        df = queries.storage_charges(args.start, args.end, args.status)
+        print(df.head(40).to_string(index=False))
+        print(f"\n{len(df)} pallets, {int(df['billable_days'].fillna(0).sum())} pallet-days, "
+              f"${df['amount'].fillna(0).sum():,.2f}; "
+              f"{int(df['rate_missing'].sum())} pallets missing a rate")
     elif args.cmd == "refresh-classification":
         print(classify.refresh())
     elif args.cmd == "bill-candidates":
@@ -123,7 +140,8 @@ def main(argv=None) -> int:
         print(df.to_string(index=False))
         print(f"\ngrand total: ${df['total_amount'].sum():,.2f} "
               f"(service ${df['service_amount'].sum():,.2f} + labor ${df['labor_amount'].sum():,.2f} "
-              f"+ materials ${df['materials_amount'].sum():,.2f})")
+              f"+ materials ${df['materials_amount'].sum():,.2f} "
+              f"+ storage ${df['storage_amount'].sum():,.2f})")
     elif args.cmd == "chain":
         print(queries.chain(args.tag).to_string(index=False))
     elif args.cmd == "billable-chain":

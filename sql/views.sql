@@ -25,6 +25,19 @@ CREATE TABLE IF NOT EXISTS creekside_core.labor_charges (
     icrunidx bigint, week_end text, productdescr text, quantity numeric,
     num_laborers numeric, hours_per_laborer numeric, labor_rate numeric, labor_charge numeric
 );
+-- Storage rates: a pallet accrues storage after a free period (free_days), then
+-- rate_per_day per pallet per day. Flat by default (commodity IS NULL = the rate
+-- for every pallet); a commodity-specific row overrides it. Editable without code
+-- (rates.set_storage_rate / cli storage-rate). See v_storage_charges.
+CREATE TABLE IF NOT EXISTS creekside_core.storage_rates (
+    commodity text, free_days integer NOT NULL DEFAULT 7, rate_per_day numeric
+);
+-- charge_type distinguishes a tag's storage billing from its packing billing on the
+-- shared billing-lines table: NULL/'PACKING' = the packing/repack service charge (all
+-- 5k legacy rows), 'STORAGE' = a storage charge. Lets a pallet be billed for both,
+-- independently. (IF EXISTS: the table is created by the ERP/ingest side, not here.)
+ALTER TABLE IF EXISTS creekside_core.cs_packing_billing_lines
+    ADD COLUMN IF NOT EXISTS charge_type text;
 -- Repack materials, ops-entered per repack run (icrunidx) — the materials half of
 -- repack time-&-materials billing (labor_charges is the labor half). Repacks carry
 -- no per-carton pack rate (see v_charges); their charge is labor + materials.
@@ -49,6 +62,8 @@ DROP VIEW IF EXISTS creekside_core.v_billed_lines;
 DROP VIEW IF EXISTS creekside_core.v_bill_candidates;
 DROP VIEW IF EXISTS creekside_core.v_billable_unbilled;
 DROP VIEW IF EXISTS creekside_core.v_bill_lines;
+DROP VIEW IF EXISTS creekside_core.v_storage_candidates;
+DROP VIEW IF EXISTS creekside_core.v_storage_charges;
 DROP VIEW IF EXISTS creekside_core.v_charges;
 DROP VIEW IF EXISTS creekside_core.v_repack_chain;
 DROP VIEW IF EXISTS creekside_core.v_repack_status;
@@ -64,7 +79,10 @@ SELECT s.pallet::bigint            AS tagid,
        min(s.lastconame)           AS lastconame,
        -- ship date (guard the cast; some footer rows carry junk)
        min(CASE WHEN s.shipdatetime ~ '^\d{2}/\d{2}/\d{4}'
-                THEN to_date(left(s.shipdatetime, 10), 'MM/DD/YYYY') END) AS ship_date
+                THEN to_date(left(s.shipdatetime, 10), 'MM/DD/YYYY') END) AS ship_date,
+       -- receive date (same guard) — drives storage days = ship_date - recv_date
+       min(CASE WHEN s.recvdate ~ '^\d{2}/\d{2}/\d{4}'
+                THEN to_date(left(s.recvdate, 10), 'MM/DD/YYYY') END) AS recv_date
 FROM creekside_core.cs_packing_shipping_raw s
 WHERE s.pallet IS NOT NULL
   AND s.recordtype = 5
@@ -122,8 +140,11 @@ ORDER BY shipped_tag, tagid, depth;
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW creekside_core.v_repack_status AS
 WITH billed AS (
+    -- packing "billed" = a packing/repack service line for the tag; storage lines
+    -- (charge_type='STORAGE') are a separate charge and must not count here.
     SELECT DISTINCT tagid::bigint AS tagid
-    FROM creekside_core.cs_packing_billing_lines WHERE tagid IS NOT NULL
+    FROM creekside_core.cs_packing_billing_lines
+    WHERE tagid IS NOT NULL AND coalesce(charge_type, 'PACKING') <> 'STORAGE'
 ),
 consumed AS (
     SELECT DISTINCT tagid::bigint AS tagid
@@ -252,12 +273,72 @@ ORDER BY billing_week, transaction_type;
 CREATE OR REPLACE VIEW creekside_core.v_billed_lines AS
 SELECT * FROM creekside_core.v_charges WHERE billed;
 
+-- ---------------------------------------------------------------------------
+-- v_storage_charges: one row per shipped pallet that sat past the free period.
+--   days_in_storage = ship_date - recv_date; billable_days = the days beyond
+--   free_days; amount = billable_days x rate_per_day (flat, per pallet). The rate
+--   and free period come from the default storage_rates row (commodity IS NULL).
+--   rate_missing flags pallets with no configured rate, and `billed` reflects a
+--   STORAGE line already recorded for the tag — mirroring the PACK conventions in
+--   v_charges. Only pallets that actually incurred storage (days > free_days) appear.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW creekside_core.v_storage_charges AS
+WITH def AS (   -- the flat rate + free period (the commodity-NULL default row)
+    SELECT coalesce(free_days, 7) AS free_days, rate_per_day
+    FROM creekside_core.storage_rates WHERE commodity IS NULL LIMIT 1
+),
+billed_storage AS (
+    SELECT DISTINCT tagid::bigint AS tagid
+    FROM creekside_core.cs_packing_billing_lines
+    WHERE tagid IS NOT NULL AND charge_type = 'STORAGE'
+)
+SELECT sh.tagid,
+       sh.sono,
+       sh.lastconame,
+       sh.recv_date,
+       sh.ship_date,
+       (sh.ship_date + mod(7 - extract(dow FROM sh.ship_date)::int, 7) * interval '1 day')::date
+           AS billing_week,
+       (sh.ship_date - sh.recv_date)                              AS days_in_storage,
+       coalesce(def.free_days, 7)                                 AS free_days,
+       (sh.ship_date - sh.recv_date) - coalesce(def.free_days, 7) AS billable_days,
+       def.rate_per_day                                           AS rate,
+       round(((sh.ship_date - sh.recv_date) - coalesce(def.free_days, 7))
+             * def.rate_per_day, 2)                               AS amount,
+       (def.rate_per_day IS NULL)                                 AS rate_missing,
+       (b.tagid IS NOT NULL)                                      AS billed
+FROM creekside_core.v_shipped sh
+LEFT JOIN def ON true
+LEFT JOIN billed_storage b ON b.tagid = sh.tagid
+WHERE sh.recv_date IS NOT NULL
+  AND sh.ship_date IS NOT NULL
+  AND (sh.ship_date - sh.recv_date) > coalesce(def.free_days, 7);
+
+-- v_storage_candidates: storage rollup by billing week (mirrors v_bill_candidates),
+-- over the not-yet-billed storage charges — what storage there is left to invoice.
+CREATE OR REPLACE VIEW creekside_core.v_storage_candidates AS
+SELECT billing_week,
+       count(*)                              AS pallets,
+       sum(billable_days)                    AS pallet_days,
+       sum(amount)                           AS amount,
+       count(*) FILTER (WHERE rate_missing)  AS pallets_missing_rate
+FROM creekside_core.v_storage_charges
+WHERE NOT billed
+GROUP BY billing_week
+ORDER BY billing_week;
+
 -- v_bill_summary: the full weekly bill — pack service (PACK only; repacks are
--- un-rated in v_charges) + repack labor + repack materials + total.
+-- un-rated in v_charges) + repack labor + repack materials + storage + total.
 CREATE OR REPLACE VIEW creekside_core.v_bill_summary AS
 WITH svc AS (
     SELECT billing_week, sum(amount) AS service_amount
     FROM creekside_core.v_bill_lines
+    GROUP BY billing_week
+),
+sto AS (
+    SELECT billing_week, sum(amount) AS storage_amount
+    FROM creekside_core.v_storage_charges
+    WHERE NOT billed
     GROUP BY billing_week
 ),
 lab AS (
@@ -276,16 +357,20 @@ weeks AS (
     SELECT billing_week FROM svc
     UNION SELECT billing_week FROM lab
     UNION SELECT billing_week FROM mat
+    UNION SELECT billing_week FROM sto
 )
 SELECT w.billing_week,
        coalesce(svc.service_amount, 0)    AS service_amount,
        coalesce(lab.labor_amount, 0)      AS labor_amount,
        coalesce(mat.materials_amount, 0)  AS materials_amount,
+       coalesce(sto.storage_amount, 0)    AS storage_amount,
        coalesce(svc.service_amount, 0)
          + coalesce(lab.labor_amount, 0)
-         + coalesce(mat.materials_amount, 0) AS total_amount
+         + coalesce(mat.materials_amount, 0)
+         + coalesce(sto.storage_amount, 0) AS total_amount
 FROM weeks w
 LEFT JOIN svc ON svc.billing_week = w.billing_week
 LEFT JOIN lab ON lab.billing_week = w.billing_week
 LEFT JOIN mat ON mat.billing_week = w.billing_week
+LEFT JOIN sto ON sto.billing_week = w.billing_week
 ORDER BY w.billing_week;

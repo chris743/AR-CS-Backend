@@ -9,6 +9,30 @@ from . import db
 from .config import SCHEMA
 
 RATES_TABLE = "packing_rates"
+STORAGE_RATES_TABLE = "storage_rates"
+
+
+def set_storage_rate(rate_per_day: float, free_days: int = 7) -> dict:
+    """Set the flat storage rate: `rate_per_day` per pallet per day after `free_days`.
+
+    Upserts the default (commodity IS NULL) row in storage_rates — the rate every
+    shipped pallet accrues once it has sat past the free period. Returns the row set.
+    """
+    with db.engine().begin() as conn:
+        conn.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+        conn.exec_driver_sql(
+            f"CREATE TABLE IF NOT EXISTS {db.qualified(STORAGE_RATES_TABLE)} "
+            "(commodity text, free_days integer NOT NULL DEFAULT 7, rate_per_day numeric)"
+        )
+        # One default row: replace it wholesale (there's no unique key on a NULL commodity).
+        conn.exec_driver_sql(
+            f"DELETE FROM {db.qualified(STORAGE_RATES_TABLE)} WHERE commodity IS NULL"
+        )
+        conn.exec_driver_sql(
+            f"INSERT INTO {db.qualified(STORAGE_RATES_TABLE)} (commodity, free_days, rate_per_day) "
+            f"VALUES (NULL, {int(free_days)}, {float(rate_per_day)})"
+        )
+    return {"commodity": None, "free_days": int(free_days), "rate_per_day": float(rate_per_day)}
 
 
 def mirror() -> int:

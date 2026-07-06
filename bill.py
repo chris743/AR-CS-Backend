@@ -12,6 +12,10 @@ from . import actions, db
 
 _DEFAULT_CUSTOMER = "1680"
 _PACKING_SERVICES_CHARGE_ID = "1106"
+# Famous charge id for storage service orders. No known default — set it here (or pass
+# storage_charge_id=) once the ERP charge is created; until then post() skips the storage
+# ERP push (and won't mark storage billed) so nothing is posted under the wrong charge.
+_STORAGE_SERVICES_CHARGE_ID: str | None = None
 
 
 def candidates() -> pd.DataFrame:
@@ -57,6 +61,14 @@ def for_period(start: str, end: str, status: str = "all") -> dict:
         f"AND to_date(week_end, 'YYYY-MM-DD') BETWEEN :s AND :e",
         s=start, e=end,
     )
+    # Storage: per-pallet days-in-storage charges over the same ship-date window/status.
+    storage = db.query(
+        f"SELECT count(*) AS pallets, sum(billable_days) AS pallet_days, "
+        f"       coalesce(sum(amount), 0) AS amount, "
+        f"       count(*) FILTER (WHERE rate_missing) AS pallets_missing_rate "
+        f"FROM {db.qualified('v_storage_charges')} WHERE {where}",
+        s=start, e=end,
+    )
     lines_df = db.query(
         f"SELECT tagid, productname, transaction_type, ship_date, billing_week, "
         f"       commodity, style, bagtype, rate, shipped_qty, amount, rate_missing, billed "
@@ -71,6 +83,7 @@ def for_period(start: str, end: str, status: str = "all") -> dict:
 
     service_total = float(svc["amount"].fillna(0).sum()) if not svc.empty else 0.0
     labor_total = float(labor["amount"].iloc[0]) if not labor.empty else 0.0
+    storage_total = float(storage["amount"].iloc[0]) if not storage.empty else 0.0
     return {
         "start": start,
         "end": end,
@@ -78,7 +91,10 @@ def for_period(start: str, end: str, status: str = "all") -> dict:
         "service": svc.fillna(0).to_dict("records"),
         "service_total": round(service_total, 2),
         "labor_total": round(labor_total, 2),
-        "total": round(service_total + labor_total, 2),
+        "storage_total": round(storage_total, 2),
+        "storage_pallets": int(storage["pallets"].iloc[0]) if not storage.empty else 0,
+        "storage_missing_rate": int(storage["pallets_missing_rate"].iloc[0]) if not storage.empty else 0,
+        "total": round(service_total + labor_total + storage_total, 2),
         "tags_missing_rate": int(svc["tags_missing_rate"].sum()) if not svc.empty else 0,
         "tags_billed": int(svc["tags_billed"].sum()) if not svc.empty else 0,
         "lines": lines_df.astype(object).where(lines_df.notna(), "").to_dict("records"),
@@ -98,6 +114,19 @@ def _billing_rows(df: pd.DataFrame, week: str) -> pd.DataFrame:
         "billed_amount": df["amount"],
         "ship_date": df["ship_date"].astype(str),
         "week_end": week,
+        "charge_type": "PACKING",
+    })
+
+
+def _storage_billing_rows(df: pd.DataFrame, week: str) -> pd.DataFrame:
+    """Map v_storage_charges rows to cs_packing_billing_lines columns (charge_type STORAGE)."""
+    return pd.DataFrame({
+        "tagid": df["tagid"],
+        "sono": df["sono"],
+        "billed_amount": df["amount"],
+        "ship_date": df["ship_date"].astype(str),
+        "week_end": week,
+        "charge_type": "STORAGE",
     })
 
 
@@ -136,6 +165,20 @@ def invoice_for_period(start: str, end: str, status: str = "all",
         s=start, e=end,
     ).iloc[0]["n"])
 
+    # Storage charges: billed on pallet-days past the free period, one invoice line
+    # per (rate, free_days). Rate-missing pallets are excluded like packing charges.
+    storage = db.query(
+        f"SELECT free_days, rate, count(*) AS pallets, sum(billable_days) AS pallet_days, "
+        f"       sum(amount) AS amount "
+        f"FROM {db.qualified('v_storage_charges')} WHERE {where} AND NOT rate_missing "
+        f"GROUP BY free_days, rate ORDER BY rate",
+        s=start, e=end,
+    )
+    skipped += int(db.query(
+        f"SELECT count(*) AS n FROM {db.qualified('v_storage_charges')} WHERE {where} AND rate_missing",
+        s=start, e=end,
+    ).iloc[0]["n"])
+
     items = []
     for r in g.itertuples():
         prefix = "REPACK SERVICES" if r.transaction_type == "REPACK" else "PACKING SERVICES"
@@ -146,6 +189,13 @@ def invoice_for_period(start: str, end: str, status: str = "all",
         items.append({
             "description": desc,
             "quantity": float(r.quantity or 0),
+            "price": float(r.rate or 0),
+            "amount": float(r.amount or 0),
+        })
+    for r in storage.itertuples():
+        items.append({
+            "description": f"STORAGE - {int(r.pallets)} pallets past {int(r.free_days)}-day free period",
+            "quantity": float(r.pallet_days or 0),
             "price": float(r.rate or 0),
             "amount": float(r.amount or 0),
         })
@@ -174,19 +224,35 @@ def invoice_for_period(start: str, end: str, status: str = "all",
     }
 
 
-def post(billing_week: str, customer_id: str = _DEFAULT_CUSTOMER,
-         charge_id: str = _PACKING_SERVICES_CHARGE_ID, comment: str | None = None) -> dict:
-    """Post the week's PACK/REPACK orders to Famous, then record billed lines.
+def _storage_lines(billing_week: str) -> pd.DataFrame:
+    """Unbilled, rated storage charges for one billing week (what to post/record)."""
+    return db.query(
+        f"SELECT tagid, sono, ship_date, billable_days, rate, amount "
+        f"FROM {db.qualified('v_storage_charges')} "
+        f"WHERE billing_week = :w AND NOT billed AND NOT rate_missing "
+        f"ORDER BY tagid",
+        w=billing_week,
+    )
 
-    External: requires the Famous ERP. Only the transaction types that post OK are
-    recorded as billed, so a partial failure is safe to retry.
+
+def post(billing_week: str, customer_id: str = _DEFAULT_CUSTOMER,
+         charge_id: str = _PACKING_SERVICES_CHARGE_ID,
+         storage_charge_id: str | None = _STORAGE_SERVICES_CHARGE_ID,
+         comment: str | None = None) -> dict:
+    """Post the week's PACK and STORAGE orders to Famous, then record billed lines.
+
+    External: requires the Famous ERP. Repacks bill via T&M (nothing to post). Each
+    charge that posts OK is recorded as billed (charge_type PACKING/STORAGE), so a
+    partial failure is safe to retry. Storage is skipped unless a storage_charge_id
+    is configured (no wrong-charge posts).
     """
     from datetime import date
     from agent.shared.famous.base.client import FamousClient, FamousError
     from agent.shared.famous.salesorder.import_order_file import build_order_payload
 
     df = lines(billing_week)
-    if df.empty:
+    sto = _storage_lines(billing_week)
+    if df.empty and sto.empty:
         return {"ok": True, "results": [], "note": f"nothing to bill for {billing_week}"}
 
     week_end = date.fromisoformat(billing_week)
@@ -225,4 +291,33 @@ def post(billing_week: str, customer_id: str = _DEFAULT_CUSTOMER,
     if posted:
         recorded = actions.record_billed(_billing_rows(df[df["transaction_type"].isin(posted)], billing_week))
 
-    return {"ok": all(r["ok"] for r in results), "results": results, "recorded": recorded}
+    # Storage: one service order for the week's storage total (like a PACK order).
+    storage_recorded = 0
+    if not sto.empty:
+        if storage_charge_id is None:
+            results.append({"transaction_type": "STORAGE", "ok": True,
+                            "skipped": "no storage_charge_id configured (see _STORAGE_SERVICES_CHARGE_ID)"})
+        else:
+            amount = float(sto["amount"].sum())
+            try:
+                payload_lines, header = build_order_payload(
+                    customer_id=customer_id, ship_date=week_end, week_end=week_end,
+                    order_date=week_end, delivery_date=week_end, amount=amount, quantity=0,
+                    charge_id=storage_charge_id, comment=comment or f"STORAGE - {we_label}",
+                    po_number=f"STORAGE WE {we_label}",
+                )
+                client = FamousClient()
+                token = client.login()
+                try:
+                    resp = client.fapi(token, "AROrderFile", f"<Payload>\n{payload_lines}</Payload>")
+                finally:
+                    client.logout(token)
+                results.append({"transaction_type": "STORAGE", "ok": True, "amount": amount, "response": resp})
+                storage_recorded = actions.record_billed(_storage_billing_rows(sto, billing_week))
+            except FamousError as e:
+                results.append({"transaction_type": "STORAGE", "ok": False, "stage": e.stage, "error": str(e)})
+            except Exception as e:
+                results.append({"transaction_type": "STORAGE", "ok": False, "error": str(e)})
+
+    return {"ok": all(r["ok"] for r in results), "results": results,
+            "recorded": recorded, "storage_recorded": storage_recorded}

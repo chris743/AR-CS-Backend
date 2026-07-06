@@ -125,8 +125,32 @@ def bill_candidates(start: str | None = None, end: str | None = None,
 
 
 def bill_summary() -> pd.DataFrame:
-    """The full weekly bill: packing/repack service + labor + total."""
+    """The full weekly bill: packing/repack service + labor + materials + storage + total."""
     return db.query(f"SELECT * FROM {db.qualified('v_bill_summary')}")
+
+
+def storage_charges(start: str | None = None, end: str | None = None,
+                    status: str = "unbilled") -> pd.DataFrame:
+    """Per-pallet storage charges (v_storage_charges), scoped by ship-date period + status.
+
+    Mirrors bill_candidates: 'unbilled' = storage left to invoice, 'billed' = a reprint,
+    'all' = every pallet that incurred storage in the window.
+    """
+    where, params = "TRUE", {}
+    if start and end:
+        where += " AND ship_date BETWEEN :s AND :e"
+        params["s"], params["e"] = start, end
+    if status == "unbilled":
+        where += " AND NOT billed"
+    elif status == "billed":
+        where += " AND billed"
+    return db.query(
+        f"SELECT tagid, sono, lastconame, recv_date, ship_date, billing_week, "
+        f"       days_in_storage, free_days, billable_days, rate, amount, rate_missing, billed "
+        f"FROM {db.qualified('v_storage_charges')} WHERE {where} "
+        f"ORDER BY billing_week, amount DESC NULLS LAST",
+        **params,
+    )
 
 
 def billable_chain() -> pd.DataFrame:
