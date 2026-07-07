@@ -336,7 +336,7 @@ WHERE sh.recv_date IS NOT NULL
 CREATE OR REPLACE VIEW creekside_core.v_storage_candidates AS
 SELECT billing_week,
        count(*)                              AS pallets,
-       sum(amount)                           AS amount,
+       coalesce(sum(amount), 0)              AS amount,
        count(*) FILTER (WHERE rate_missing)  AS pallets_missing_rate
 FROM creekside_core.v_storage_charges
 WHERE NOT billed

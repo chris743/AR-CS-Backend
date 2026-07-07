@@ -17,4 +17,6 @@ from standalone.server import app  # noqa: E402
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8100
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    # 0.0.0.0 so the frontend on another host (e.g. 10.0.1.105) can reach the API,
+    # not just localhost. CORS for that origin is configured in server.py.
+    uvicorn.run(app, host="0.0.0.0", port=port)

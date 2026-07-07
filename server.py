@@ -14,9 +14,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.routing import Route
+
+# Origins allowed to call the API cross-origin (browser CORS). The React frontend
+# runs on a separate host/port, so its origin must be listed here. Same-origin
+# requests (React served from this app at /) don't need this.
+_CORS_ORIGINS = [
+    "http://10.0.1.105:5001",
+]
 
 try:  # works whether launched as `standalone.server` or as a top-level module
     from . import bill, classify, ingest, labor, queries, rates
@@ -241,6 +250,14 @@ async def api_classification_refresh(request: Request) -> JSONResponse:
 
 
 app = Starlette(
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=_CORS_ORIGINS,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["*"],
+        ),
+    ],
     routes=[
         Route("/", index, methods=["GET"]),
         Route("/api/meta", api_meta, methods=["GET"]),
