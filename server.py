@@ -21,11 +21,11 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.routing import Route
 
 # Origins allowed to call the API cross-origin (browser CORS). The React frontend
-# runs on a separate host/port, so its origin must be listed here. Same-origin
-# requests (React served from this app at /) don't need this.
-_CORS_ORIGINS = [
-    "http://10.0.1.105:5001",
-]
+# runs on a separate host/port, and on this LAN both the frontend and backend get
+# DHCP IPs that change, so pinning exact origins is fragile. This API has no
+# cookie/credentialed auth, so allowing any origin ("*") is safe here. Narrow this
+# to a specific origin list if the API ever gains credentialed auth.
+_CORS_ORIGINS = ["*"]
 
 try:  # works whether launched as `standalone.server` or as a top-level module
     from . import bill, classify, ingest, labor, queries, rates
