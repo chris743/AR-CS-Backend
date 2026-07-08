@@ -44,11 +44,32 @@ def run_sql_file(path: str | Path) -> None:
         conn.exec_driver_sql(sql)
 
 
+def _table_exists(conn, table: str) -> bool:
+    return bool(
+        conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = :s AND table_name = :t"
+            ),
+            {"s": SCHEMA, "t": table},
+        ).scalar()
+    )
+
+
 def replace(df: pd.DataFrame, table: str) -> int:
-    """Drop+reload a table with df (snapshot ingest)."""
+    """Full-refresh a table with df (snapshot ingest).
+
+    If the table already exists we TRUNCATE + append rather than drop/recreate,
+    so views built on top of it (v_repack_chain, v_charges, ...) stay valid.
+    A plain DROP would fail once those views exist.
+    """
     with engine().begin() as conn:
         _ensure_schema(conn)
-        df.to_sql(table, conn, schema=SCHEMA, if_exists="replace", index=False)
+        if _table_exists(conn, table):
+            conn.exec_driver_sql(f"TRUNCATE {qualified(table)}")
+            df.to_sql(table, conn, schema=SCHEMA, if_exists="append", index=False)
+        else:
+            df.to_sql(table, conn, schema=SCHEMA, if_exists="replace", index=False)
     return len(df)
 
 
