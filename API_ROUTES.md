@@ -179,6 +179,21 @@ summary. **Slow** (downloads + per-PDF AI extraction; tens of seconds) and
 requires the AI/SharePoint/SMB stack — show a long spinner; surface
 `needs_review` when present.
 
+### `GET /api/shipping/folders`
+The available WE folders on SharePoint, **grouped year → month → week**, for a
+folder picker (so the UI no longer types a raw `week_folder` string). Each week
+is annotated with any existing run's `status`/`total` (`has_run:false` if never
+run). Newest-first at every level.
+```json
+{ "years": [
+    { "year": 2026, "months": [
+        { "month": 5, "label": "May 2026", "weeks": [
+            { "week_folder": "WE 05.17.2026", "date": "2026-05-17",
+              "status": "posted", "total": 4231.55, "has_run": true } ] } ] } ] }
+```
+Feeds the `week_folder` sent to `POST /api/shipping/run`. `status` is one of the
+run statuses or `null`; `total` is `null` until built.
+
 ### `GET /api/shipping/runs`
 All runs, newest first (lightweight list). Array of:
 ```json

@@ -159,6 +159,42 @@ def list_runs() -> list[dict]:
     return runs
 
 
+_MONTHS = ("", "January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December")
+
+
+def list_folders() -> dict:
+    """WE folders from SharePoint, grouped year -> month -> week for a picker.
+
+    Each week is annotated with any existing run's status/total so the UI can
+    show what's already built or posted. Ordered newest-first at every level.
+    """
+    runs = {r["week_folder"]: r for r in store.list_all()}
+    years: dict[int, dict[int, list[dict]]] = {}
+
+    for f in phytos.list_we_folders():
+        y, m = int(f["date"][:4]), int(f["date"][5:7])
+        run = runs.get(f["week_folder"])
+        total = float(run["total"]) if run and run.get("total") is not None else None
+        week = {
+            "week_folder": f["week_folder"],
+            "date": f["date"],
+            "status": run["status"] if run else None,
+            "total": total,
+            "has_run": run is not None,
+        }
+        years.setdefault(y, {}).setdefault(m, []).append(week)
+
+    out = []
+    for y in sorted(years, reverse=True):
+        months = [
+            {"month": m, "label": f"{_MONTHS[m]} {y}", "weeks": years[y][m]}
+            for m in sorted(years[y], reverse=True)
+        ]
+        out.append({"year": y, "months": months})
+    return {"years": out}
+
+
 def xlsx_path(week_folder: str | None = None) -> str | None:
     run = store.get(week_folder) if week_folder else store.latest()
     return run.get("xlsx_path") if run else None

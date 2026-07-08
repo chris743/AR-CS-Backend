@@ -76,6 +76,34 @@ def _most_recent_we_folder(items: list[dict]) -> dict:
     return dated[0][1]
 
 
+def list_we_folders() -> list[dict]:
+    """Every 'WE mm.dd.yyyy' folder under the Creekside dir, newest first.
+
+    Returns [{"week_folder": "WE 05.17.2026", "date": "2026-05-17"}]. The name
+    encodes the date, so callers can group by year/month without extra fetches.
+    """
+    with _client() as client:
+        site_id = _site_id(client)
+        drive_id = _drive_id(client, site_id)
+        children = _children(client, drive_id, config.SP_CREEKSIDE_DIR)
+
+    dated = []
+    for item in children:
+        if "folder" not in item:
+            continue
+        m = _WE_RE.match(item["name"])
+        if not m:
+            continue
+        mm, dd, yyyy = m.groups()
+        try:
+            d = datetime(int(yyyy), int(mm), int(dd))
+        except ValueError:
+            continue
+        dated.append((d, item["name"]))
+    dated.sort(key=lambda x: x[0], reverse=True)
+    return [{"week_folder": name, "date": d.date().isoformat()} for d, name in dated]
+
+
 def _download(client, drive_id: str, item_id: str, dest: Path) -> None:
     r = client.get(f"/drives/{drive_id}/items/{item_id}/content", follow_redirects=True)
     r.raise_for_status()

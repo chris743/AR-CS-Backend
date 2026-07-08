@@ -41,6 +41,13 @@ async def api_shipping_runs(request: Request) -> JSONResponse:
         return _err(str(e))
 
 
+async def api_shipping_folders(request: Request) -> JSONResponse:
+    try:
+        return JSONResponse(flow.list_folders())
+    except Exception as e:
+        return _err(str(e))
+
+
 async def api_shipping_run_get(request: Request) -> JSONResponse:
     week = request.query_params.get("week_folder") or None
     try:
@@ -100,6 +107,7 @@ async def api_shipping_xlsx(request: Request) -> FileResponse | JSONResponse:
 routes = [
     Route("/api/shipping/run", api_shipping_run, methods=["POST"]),
     Route("/api/shipping/runs", api_shipping_runs, methods=["GET"]),
+    Route("/api/shipping/folders", api_shipping_folders, methods=["GET"]),
     Route("/api/shipping/run", api_shipping_run_get, methods=["GET"]),
     Route("/api/shipping/review", api_shipping_review, methods=["POST"]),
     Route("/api/shipping/post", api_shipping_post, methods=["POST"]),
