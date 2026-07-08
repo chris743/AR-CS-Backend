@@ -154,6 +154,54 @@ async def api_bill_post(request: Request) -> JSONResponse:
         return _err(str(e))
 
 
+# --- storage ----------------------------------------------------------------
+
+async def api_storage(request: Request) -> JSONResponse:
+    """Per-pallet storage charges for a ship-date window, plus a per-pack-form summary.
+
+    Wraps queries.storage_charges. The summary rollup mirrors the storage half of
+    bill.invoice_for_period: rated pallets grouped by (commodity, style, bagtype,
+    rate); rate-missing pallets are counted but excluded from summary and total.
+    """
+    qp = request.query_params
+    start = qp.get("start")
+    end = qp.get("end")
+    status = qp.get("status", "all")
+    if not start or not end:
+        return _err("start and end (YYYY-MM-DD) are required", 400)
+    try:
+        df = queries.storage_charges(start, end, status)
+        lines = _records(df)
+        pallets = len(df)
+        pallets_missing_rate = int(df["rate_missing"].sum()) if not df.empty else 0
+        pallets_billed = int(df["billed"].sum()) if not df.empty else 0
+
+        rated = df[~df["rate_missing"].astype(bool)] if not df.empty else df
+        summary, total = [], 0.0
+        if not rated.empty:
+            rated = rated.assign(carton_days=rated["shipped_qty"] * rated["billable_days"])
+            for (commodity, style, bagtype, rate), grp in rated.groupby(
+                ["commodity", "style", "bagtype", "rate"], dropna=False, sort=True
+            ):
+                summary.append({
+                    "commodity": _json_safe(commodity), "style": _json_safe(style),
+                    "bagtype": _json_safe(bagtype), "rate": _json_safe(rate),
+                    "pallets": int(len(grp)),
+                    "carton_days": _json_safe(grp["carton_days"].sum()),
+                    "amount": round(float(grp["amount"].sum()), 2),
+                })
+            total = round(float(rated["amount"].sum()), 2)
+
+        return _ok({
+            "start": start, "end": end, "status": status,
+            "summary": summary, "total": total, "pallets": pallets,
+            "pallets_missing_rate": pallets_missing_rate,
+            "pallets_billed": pallets_billed, "lines": lines,
+        })
+    except Exception as e:
+        return _err(str(e))
+
+
 # --- reconciliation ---------------------------------------------------------
 
 async def api_status_summary(request: Request) -> JSONResponse:
@@ -266,6 +314,7 @@ app = Starlette(
         Route("/api/bill/candidates", api_bill_candidates, methods=["GET"]),
         Route("/api/bill/summary", api_bill_summary, methods=["GET"]),
         Route("/api/bill/post", api_bill_post, methods=["POST"]),
+        Route("/api/storage", api_storage, methods=["GET"]),
         Route("/api/status/summary", api_status_summary, methods=["GET"]),
         Route("/api/status", api_status, methods=["GET"]),
         Route("/api/chain/{tag}", api_chain, methods=["GET"]),
