@@ -20,6 +20,6 @@ REPACKING_FILE = "repack outputs report - most recent.csv"
 SHIPPING_FILE = "shipping report - most recent.csv"
 
 # Local landing spots (defaults for the CLI).
-REPACKING_LOCAL = "/mnt/creekside_share/repacking_report.csv"
-SHIPPING_LOCAL = "/mnt/creekside_share/shipping_report.csv"
+REPACKING_LOCAL = "/home/administrator/mnt/creekside-share/repack outputs report - most recent.csv"
+SHIPPING_LOCAL = "/home/administrator/mnt/creekside-share/shipping report - most recent.csv"
 SHIPPING_ENCODING = "cp1252"
